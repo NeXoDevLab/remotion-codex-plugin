@@ -1,0 +1,94 @@
+name: Sync upstream safely
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Sync without overwriting fork changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          default_branch="${GITHUB_REF_NAME}"
+          upstream_repo="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // empty')"
+          upstream_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.default_branch // empty')"
+
+          if [[ -z "${upstream_repo}" || -z "${upstream_branch}" ]]; then
+            echo "::error::This repository is not a fork or its upstream is unavailable."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${upstream_repo}.git"
+          git fetch --no-tags upstream "+refs/heads/${upstream_branch}:refs/remotes/upstream/${upstream_branch}"
+
+          local_sha="$(git rev-parse HEAD)"
+          upstream_sha="$(git rev-parse "upstream/${upstream_branch}")"
+          short_sha="${upstream_sha:0:12}"
+          sync_branch="sync/upstream-${short_sha}"
+
+          if [[ "${local_sha}" == "${upstream_sha}" ]]; then
+            echo "Fork is already up to date." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor "${local_sha}" "${upstream_sha}"; then
+            if git push origin "${upstream_sha}:refs/heads/${default_branch}"; then
+              echo "Fast-forwarded ${default_branch} to ${upstream_repo}:${upstream_branch}." >> "${GITHUB_STEP_SUMMARY}"
+              exit 0
+            fi
+            echo "Direct fast-forward was blocked; opening a pull request instead." >> "${GITHUB_STEP_SUMMARY}"
+            git switch --detach "${upstream_sha}"
+            git switch -c "${sync_branch}"
+          elif git merge-base --is-ancestor "${upstream_sha}" "${local_sha}"; then
+            echo "The fork contains all upstream commits; no update is needed." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          else
+            git switch -c "${sync_branch}" "origin/${default_branch}"
+            if ! git merge --no-ff --no-edit "upstream/${upstream_branch}"; then
+              git merge --abort || true
+              echo "::error::Upstream changes conflict with fork changes. Manual resolution is required."
+              echo "Upstream changes conflict with fork changes; no branch was overwritten." >> "${GITHUB_STEP_SUMMARY}"
+              exit 1
+            fi
+          fi
+
+          if git ls-remote --exit-code --heads origin "refs/heads/${sync_branch}" >/dev/null 2>&1; then
+            echo "Sync branch ${sync_branch} already exists; it was not overwritten." >> "${GITHUB_STEP_SUMMARY}"
+          else
+            git push origin "${sync_branch}"
+          fi
+
+          if gh pr list --base "${default_branch}" --head "${sync_branch}" --state open --json number --jq 'length' | grep -qx '0'; then
+            gh pr create \
+              --base "${default_branch}" \
+              --head "${sync_branch}" \
+              --title "Sync ${default_branch} with upstream" \
+              --body "Automated conservative sync from \`${upstream_repo}:${upstream_branch}\`. This pull request preserves commits made in this fork and was created because a direct fast-forward was not possible or was blocked. No force push was used."
+          fi
+
+          echo "Opened or reused a pull request for ${upstream_repo}:${upstream_branch}." >> "${GITHUB_STEP_SUMMARY}"
+
